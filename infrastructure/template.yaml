@@ -1,0 +1,521 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: SmartQueue Academy stack (Cognito, HTTP API, Lambda, DynamoDB, private documents S3, static frontend S3, SQS, SNS, EventBridge).
+
+Parameters:
+  ApplicationName:
+    Type: String
+    Default: smartqueue
+    AllowedPattern: '[a-zA-Z0-9-]+'
+  StageName:
+    Type: String
+    Default: prod
+  FrontendOrigin:
+    Type: String
+    Default: http://localhost:5173
+  EnablePointInTimeRecovery:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+  AlertsEmail:
+    Type: String
+    Default: ''
+    Description: Optional email address for CloudWatch operational alerts. Confirm the SNS subscription after deployment.
+
+Conditions:
+  HasAlertsEmail: !Not [!Equals [!Ref AlertsEmail, '']]
+
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    MemorySize: 256
+    Timeout: 15
+    CodeUri: ../backend/
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref ApplicationTable
+        DOCUMENT_BUCKET: !Ref DocumentsBucket
+        EVENT_QUEUE_URL: !Ref QueueEvents
+        APPLICATION_NAME: !Ref ApplicationName
+        USER_POOL_ID: !Ref UserPool
+        USER_POOL_CLIENT_ID: !Ref UserPoolClient
+    Architectures:
+      - arm64
+
+Resources:
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${ApplicationName}-users'
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+      Schema:
+        - Name: name
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+        - Name: phone_number
+          AttributeDataType: String
+          Mutable: true
+          Required: false
+      UserPoolTags:
+        Application: !Ref ApplicationName
+
+  UserGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: USER
+      UserPoolId: !Ref UserPool
+  StaffGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: STAFF
+      UserPoolId: !Ref UserPool
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: ADMIN
+      UserPoolId: !Ref UserPool
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub '${ApplicationName}-web'
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+
+  ApplicationTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub '${ApplicationName}-application'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: S
+        - AttributeName: GSI2PK
+          AttributeType: S
+        - AttributeName: GSI2SK
+          AttributeType: S
+        - AttributeName: GSI3PK
+          AttributeType: S
+        - AttributeName: GSI3SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: GSI2
+          KeySchema:
+            - AttributeName: GSI2PK
+              KeyType: HASH
+            - AttributeName: GSI2SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: GSI3
+          KeySchema:
+            - AttributeName: GSI3PK
+              KeyType: HASH
+            - AttributeName: GSI3SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !Equals [!Ref EnablePointInTimeRecovery, 'true']
+      SSESpecification:
+        SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  DocumentsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ApplicationName}-documents-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [POST, GET, HEAD]
+            AllowedOrigins:
+              - !Ref FrontendOrigin
+              - !GetAtt FrontendBucket.WebsiteURL
+            ExposedHeaders: [ETag]
+            MaxAge: 300
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+
+  DocumentsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DocumentsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: RequireTLS
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt DocumentsBucket.Arn
+              - !Sub '${DocumentsBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  QueueEvents:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 120
+      MessageRetentionPeriod: 345600
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt QueueEventsDeadLetter.Arn
+        maxReceiveCount: 5
+  QueueEventsDeadLetter:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+  # SNS uses its service-managed encryption; a customer-managed KMS key is not required.
+
+  OperationsAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ApplicationName}-operations-alerts'
+
+  OperationsAlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertsEmail
+    Properties:
+      TopicArn: !Ref OperationsAlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertsEmail
+
+  DeadLetterQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Messages have reached the SmartQueue queue dead-letter queue.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt QueueEventsDeadLetter.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OperationsAlertsTopic
+
+  ApiLambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: The SmartQueue API Lambda function has reported an execution error.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ApiFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OperationsAlertsTopic
+
+  RestApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref StageName
+      Auth:
+        Authorizers:
+          CognitoJwt:
+            IdentitySource: '$request.header.Authorization'
+            JwtConfiguration:
+              issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+              audience:
+                - !Ref UserPoolClient
+        DefaultAuthorizer: CognitoJwt
+      CorsConfiguration:
+        AllowOrigins:
+          - !Ref FrontendOrigin
+          - !GetAtt FrontendBucket.WebsiteURL
+        AllowHeaders: ['authorization', 'content-type']
+        AllowMethods: [GET, POST, PUT, DELETE, OPTIONS]
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","routeKey":"$context.routeKey","status":"$context.status"}'
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ApplicationName}'
+      RetentionInDays: 14
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ApplicationName}-api'
+      Handler: src/index.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ApplicationTable
+        - S3CrudPolicy:
+            BucketName: !Ref DocumentsBucket
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt QueueEvents.QueueName
+        - Statement:
+            - Effect: Allow
+              Action: sns:CreateTopic
+              Resource: !Sub 'arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${ApplicationName}-user-*'
+            - Effect: Allow
+              Action: sns:Subscribe
+              Resource: !Sub 'arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${ApplicationName}-user-*'
+      Events:
+        Organizations:
+          Type: HttpApi
+          Properties: { ApiId: !Ref RestApi, Path: /organizations, Method: GET }
+        Departments:
+          Type: HttpApi
+          Properties: { ApiId: !Ref RestApi, Path: '/organizations/{id}/departments', Method: GET }
+        Services:
+          Type: HttpApi
+          Properties: { ApiId: !Ref RestApi, Path: /services, Method: GET }
+        Service:
+          Type: HttpApi
+          Properties: { ApiId: !Ref RestApi, Path: '/services/{id}', Method: GET }
+        Availability:
+          Type: HttpApi
+          Properties: { ApiId: !Ref RestApi, Path: '/services/{id}/availability', Method: GET }
+        CreateAppointment:
+          Type: HttpApi
+          Properties: { ApiId: !Ref RestApi, Path: /appointments, Method: POST }
+        MyAppointments:
+          Type: HttpApi
+          Properties: { ApiId: !Ref RestApi, Path: /appointments/my, Method: GET }
+        Appointment:
+          Type: HttpApi
+          Properties: { ApiId: !Ref RestApi, Path: '/appointments/{id}', Method: GET }
+        UpdateAppointment:
+          Type: HttpApi
+          Properties: { ApiId: !Ref RestApi, Path: '/appointments/{id}', Method: PUT }
+        CancelAppointment:
+          Type: HttpApi
+          Properties: { ApiId: !Ref RestApi, Path: '/appointments/{id}', Method: DELETE }
+        Queue:
+          Type: HttpApi
+          Properties: { ApiId: !Ref RestApi, Path: '/queue/{serviceId}', Method: GET }
+        JoinQueue:
+          Type: HttpApi
+          Properties: { ApiId: !Ref RestApi, Path: /queue/join, Method: POST }
+        CallNext:
+          Type: HttpApi
+          Properties: { ApiId: !Ref RestApi, Path: /queue/next, Method: POST }
+        QueueAction:
+          Type: HttpApi
+          Properties: { ApiId: !Ref RestApi, Path: '/queue/{queueId}/{action}', Method: POST }
+        UploadDocument:
+          Type: HttpApi
+          Properties: { ApiId: !Ref RestApi, Path: /documents/upload, Method: POST }
+        AppointmentDocuments:
+          Type: HttpApi
+          Properties: { ApiId: !Ref RestApi, Path: '/appointments/{id}/documents', Method: GET }
+        DownloadDocument:
+          Type: HttpApi
+          Properties: { ApiId: !Ref RestApi, Path: '/documents/{id}/download', Method: GET }
+        CompleteDocumentUpload:
+          Type: HttpApi
+          Properties: { ApiId: !Ref RestApi, Path: '/documents/{id}/complete', Method: POST }
+        DeleteDocument:
+          Type: HttpApi
+          Properties: { ApiId: !Ref RestApi, Path: '/documents/{id}', Method: DELETE }
+        Notifications:
+          Type: HttpApi
+          Properties: { ApiId: !Ref RestApi, Path: /notifications, Method: GET }
+        SubscribeNotifications:
+          Type: HttpApi
+          Properties: { ApiId: !Ref RestApi, Path: /notifications/subscribe, Method: POST }
+        Profile:
+          Type: HttpApi
+          Properties: { ApiId: !Ref RestApi, Path: /users/me, Method: GET }
+        CreateOrganization:
+          Type: HttpApi
+          Properties: { ApiId: !Ref RestApi, Path: /admin/organizations, Method: POST }
+        CreateService:
+          Type: HttpApi
+          Properties: { ApiId: !Ref RestApi, Path: /admin/services, Method: POST }
+        CreateDepartment:
+          Type: HttpApi
+          Properties: { ApiId: !Ref RestApi, Path: /admin/departments, Method: POST }
+        StaffAppointments:
+          Type: HttpApi
+          Properties: { ApiId: !Ref RestApi, Path: /staff/appointments, Method: GET }
+        PauseQueue:
+          Type: HttpApi
+          Properties: { ApiId: !Ref RestApi, Path: '/queue/{serviceId}/pause', Method: POST }
+        ResumeQueue:
+          Type: HttpApi
+          Properties: { ApiId: !Ref RestApi, Path: '/queue/{serviceId}/resume', Method: POST }
+        CheckIn:
+          Type: HttpApi
+          Properties: { ApiId: !Ref RestApi, Path: '/appointments/{id}/check-in', Method: POST }
+  ApiFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ApplicationName}-api'
+      RetentionInDays: 14
+
+  QueueWorker:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ApplicationName}-queue-worker'
+      Handler: src/worker.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ApplicationTable
+        - SQSPollerPolicy:
+            QueueName: !GetAtt QueueEvents.QueueName
+        - Statement:
+            - Effect: Allow
+              Action: sns:Publish
+              Resource: !Sub 'arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${ApplicationName}-user-*'
+      Events:
+        QueueMessages:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt QueueEvents.Arn
+            BatchSize: 10
+            FunctionResponseTypes: [ReportBatchItemFailures]
+
+  QueueWorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ApplicationName}-queue-worker'
+      RetentionInDays: 14
+
+  ReminderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ApplicationName}-reminders'
+      Handler: src/reminders.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ApplicationTable
+        - Statement:
+            - Effect: Allow
+              Action: sns:Publish
+              Resource: !Sub 'arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${ApplicationName}-user-*'
+      Events:
+        Schedule:
+          Type: Schedule
+          Properties:
+            Schedule: cron(5 0 * * ? *)
+            Enabled: true
+
+  ReminderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ApplicationName}-reminders'
+      RetentionInDays: 14
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ApplicationName}-frontend-${AWS::AccountId}-${AWS::Region}'
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: false
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: false
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublicReadOnlyCompiledFrontend
+            Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource:
+              - !Sub '${FrontendBucket.Arn}/index.html'
+              - !Sub '${FrontendBucket.Arn}/assets/*'
+
+Outputs:
+  ApiUrl:
+    Description: Authenticated SmartQueue REST API endpoint
+    Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}'
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  DocumentsBucketName:
+    Value: !Ref DocumentsBucket
+  FrontendBucketName:
+    Value: !Ref FrontendBucket
+  FrontendUrl:
+    Description: S3 static website endpoint for the compiled frontend
+    Value: !GetAtt FrontendBucket.WebsiteURL

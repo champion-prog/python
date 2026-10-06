@@ -1,0 +1,17 @@
+{
+  "name": "smartqueue-backend",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.850.0",
+    "@aws-sdk/client-s3": "^3.850.0",
+    "@aws-sdk/client-sns": "^3.850.0",
+    "@aws-sdk/client-sqs": "^3.850.0",
+    "@aws-sdk/lib-dynamodb": "^3.850.0",
+    "@aws-sdk/s3-presigned-post": "^3.850.0",
+    "@aws-sdk/s3-request-presigner": "^3.850.0"
+  }
+}
